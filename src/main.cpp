@@ -4,7 +4,11 @@ bool sendTelemetry(int totalSeen = -1, int totalReported = -1, int totalAdverts 
 {
     if (!online)
     {
-        if (sendOnline() && sendDiscoveryConnectivity() && sendDiscoveryMaxDistance() && sendDiscoveryMotion())
+        if (sendOnline() && 
+            sendDiscoveryConnectivity() && 
+            sendDiscoveryMaxDistance() && 
+            sendDiscoveryMotion() &&
+            sendDiscoveryBMESensor())
         {
             online = true;
             reconnectTries = 0;
@@ -283,6 +287,36 @@ void scanForDevices(void *parameter)
     }
 }
 
+void bmeReport(TimerHandle_t xTimer)
+{
+    float temp(NAN), hum(NAN), pres(NAN);
+    BME280::TempUnit tempUnit(BME280::TempUnit_Celsius);
+    BME280::PresUnit presUnit(BME280::PresUnit_Pa);
+
+    DynamicJsonDocument doc(1200);
+    char buffer[1200];
+
+    bme.read(pres, temp, hum, tempUnit, presUnit);
+
+    doc["temperature"] = String(temp);
+    doc["humidity"] = String(hum);
+    doc["pressure"] = String(pres);
+
+    serializeJson(doc, buffer);
+
+    for (int i = 0; i < 10; i++)
+    {
+        if (mqttClient.publish((roomsTopic + "weather").c_str(), 0, true, buffer))
+            return;
+        delay(50);
+    }
+}
+
+void startBMETimer(void)
+{
+    bmeReportTimer = xTimerCreate("bmeReportTimer", pdMS_TO_TICKS(5000), pdTRUE, (void *)0, bmeReport);
+}
+
 void setup()
 {
 #ifdef LED_BUILTIN
@@ -303,6 +337,7 @@ void setup()
 #endif
     connectToMqtt();
     xTaskCreatePinnedToCore(scanForDevices, "BLE Scan", 5120, nullptr, 1, &scannerTask, 1);
+    startBMETimer();
     configureOTA();
 }
 

@@ -14,6 +14,10 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/timers.h>
 #include <rom/rtc.h>
+#include <Wire.h>
+#include <BME280.h>
+#include <BME280I2C.h>
+#include <EnvironmentCalculations.h>
 
 #include "BleFingerprint.h"
 #include "BleFingerprintCollection.h"
@@ -23,6 +27,7 @@
 AsyncMqttClient mqttClient;
 TimerHandle_t reconnectTimer;
 TaskHandle_t scannerTask;
+TimerHandle_t bmeReportTimer;
 
 bool updateInProgress = false;
 String localIp;
@@ -53,6 +58,19 @@ int radarPin;
 int lastPirValue = -1;
 int lastRadarValue = -1;
 
+BME280I2C::Settings settings
+(
+    BME280::OSR_X1,
+    BME280::OSR_X1,
+    BME280::OSR_X1,
+    BME280::Mode_Forced,
+    BME280::StandbyTime_1000ms,
+    BME280::Filter_Off,
+    BME280::SpiEnable_False,
+    BME280I2C::I2CAddr_0x77
+);
+
+BME280I2C bme(settings);
 BleFingerprintCollection fingerprints(MAX_MAC_ADDRESSES);
 
 String resetReason(RESET_REASON reason)
@@ -172,7 +190,7 @@ void firmwareUpdate()
     WiFiClientSecure client;
     client.setInsecure();
 
-    String firmwareUrl = Sprintf("https://github.com/ESPresense/ESPresense/releases/latest/download/%s.bin", FIRMWARE);
+    String firmwareUrl = Sprintf("https://github.com/rbarreiros/ESPresense/releases/latest/download/%s.bin", FIRMWARE);
     if (!http.begin(client, firmwareUrl))
         return;
 
@@ -255,8 +273,10 @@ bool sendOnline()
     return mqttClient.publish(statusTopic.c_str(), 0, 1, "online") && mqttClient.publish((roomsTopic + "/max_distance").c_str(), 0, 1, String(maxDistance).c_str());
 }
 
-void commonDiscovery(JsonDocument *doc)
+bool commonDiscovery(JsonDocument *doc, String discoveryTopic)
 {
+    char buffer[1200];
+
     JsonArray identifiers = (*doc)["dev"].createNestedArray("ids");
     identifiers.add(WiFi.macAddress());
     JsonArray connections = (*doc)["dev"].createNestedArray("cns");
@@ -264,15 +284,23 @@ void commonDiscovery(JsonDocument *doc)
     (*doc)["dev"]["name"] = "ESPresense " + room;
     (*doc)["dev"]["sa"] = room;
     (*doc)["dev"]["mdl"] = ESP.getChipModel();
+
+    serializeJson(*doc, buffer);
+
+    for (int i = 0; i < 10; i++)
+    {
+        if (mqttClient.publish(discoveryTopic.c_str(), 0, true, buffer))
+            return true;
+        delay(50);
+    }
+
+    return false;
 }
 
 bool sendDiscoveryConnectivity()
 {
     if (!discovery) return true;
-    String discoveryTopic = "homeassistant/binary_sensor/espresense_" + room + "/connectivity/config";
-
     DynamicJsonDocument doc(1200);
-    char buffer[1200];
 
     doc["~"] = roomsTopic;
     doc["name"] = "ESPresense " + room;
@@ -284,28 +312,15 @@ bool sendDiscoveryConnectivity()
     doc["pl_on"] = "online";
     doc["pl_off"] = "offline";
 
-    commonDiscovery(&doc);
-    serializeJson(doc, buffer);
-
-    for (int i = 0; i < 10; i++)
-    {
-        if (mqttClient.publish(discoveryTopic.c_str(), 0, true, buffer))
-            return true;
-        delay(50);
-    }
-
-    return false;
+    return commonDiscovery(&doc, 
+                           "homeassistant/binary_sensor/espresense_" + room + "/connectivity/config");
 }
 
 bool sendDiscoveryMotion()
 {
     if (!discovery) return true;
     if (!pirPin && !radarPin) return true;
-
-    String discoveryTopic = "homeassistant/binary_sensor/espresense_" + room + "/motion/config";
-
     DynamicJsonDocument doc(1200);
-    char buffer[1200];
 
     doc["~"] = roomsTopic;
     doc["name"] = "ESPresense " + room + " Motion";
@@ -314,25 +329,14 @@ bool sendDiscoveryMotion()
     doc["stat_t"] = "~/motion";
     doc["dev_cla"] = "motion";
 
-    commonDiscovery(&doc);
-    serializeJson(doc, buffer);
-
-    for (int i = 0; i < 10; i++)
-    {
-        if (mqttClient.publish(discoveryTopic.c_str(), 0, true, buffer))
-            return true;
-        delay(50);
-    }
-    return false;
+    return commonDiscovery(&doc,
+                           "homeassistant/binary_sensor/espresense_" + room + "/motion/config");
 }
 
 bool sendDiscoveryMaxDistance()
 {
     if (!discovery) return true;
-    String discoveryTopic = "homeassistant/number/espresense_" + room + "/max_distance/config";
-
     DynamicJsonDocument doc(1200);
-    char buffer[1200];
 
     doc["~"] = roomsTopic;
     doc["name"] = "ESPresense " + room + " Max Distance";
@@ -341,17 +345,59 @@ bool sendDiscoveryMaxDistance()
     doc["stat_t"] = "~/max_distance";
     doc["cmd_t"] = "~/max_distance/set";
 
-    commonDiscovery(&doc);
-    serializeJson(doc, buffer);
+    return commonDiscovery(&doc,
+                           "homeassistant/number/espresense_" + room + "/max_distance/config");
+}
 
-    for (int i = 0; i < 10; i++)
-    {
-        if (mqttClient.publish(discoveryTopic.c_str(), 0, true, buffer))
-            return true;
-        delay(50);
-    }
+bool sendDiscoveryBMESensor()
+{
+    if(!discovery) return true;
+    bool ret = false;
 
-    return false;
+    DynamicJsonDocument doc(1200);
+
+    doc["~"] = roomsTopic;
+    doc["unit_of_meas"] = "°C";
+    doc["dev_cla"] = "temperature";
+    doc["stat_t"] = "~/weather";
+    doc["name"] = "ESPresence " + room + " Temperature";
+    doc["unique_id"] = WiFi.macAddress() + "_temp";
+    doc["avty_t"] = "~/status";
+    doc["value_template"] = "{{ value_json.temperature }}";
+
+    ret &= commonDiscovery(&doc, 
+                           "homeassistant/sensor/espresence_" + room + "/temperature/config");
+
+    doc.clear();
+
+    doc["~"] = roomsTopic;
+    doc["unit_of_meas"] = "%";
+    doc["dev_cla"] = "humidity";
+    doc["stat_t"] = "~/weather";
+    doc["name"] = "ESPresence " + room + " Humidity";
+    doc["unique_id"] = WiFi.macAddress() + "_hum";
+    doc["avty_t"] = "~/status";
+    doc["value_template"] = "{{ value_json.humidity }}";
+
+    ret &= commonDiscovery(&doc, 
+                           "homeassistant/sensor/espresence_" + room + "/humidity/config");
+
+    doc.clear();
+
+    doc["~"] = roomsTopic;
+    doc["unit_of_meas"] = "Pa";
+    doc["dev_cla"] = "pressure";
+    doc["stat_t"] = "~/weather";
+    doc["name"] = "ESPresence " + room + " Pressure";
+    doc["unique_id"] = WiFi.macAddress() + "_pres";
+    doc["avty_t"] = "~/status";
+    doc["value_template"] = "{{ value_json.pressure }}";
+
+    ret &= commonDiscovery(&doc, 
+                           "homeassistant/sensor/espresence_" + room + "/pressure/config");
+
+
+    return ret;
 }
 
 bool spurt(const String &fn, const String &content)
